@@ -1,0 +1,21 @@
+{
+  "name": "a8a8-class-portal-backend",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node.js + Express + Firebase Admin backend for Lớp 8A8 - Trường THCS Cẩm Lý 2",
+  "type": "module",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.7",
+    "express": "^5.1.0",
+    "firebase-admin": "^13.5.0",
+    "node-cron": "^4.2.1"
+  }
+}
