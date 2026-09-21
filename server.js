@@ -35,6 +35,7 @@ const CONTENT_COLLECTIONS = new Set([
   "privateFeedback",
   "quizResults",
   "honors",
+  "criticisms",
   "notifications",
 ]);
 
@@ -753,361 +754,105 @@ app.patch("/api/admin/students/:id/score", authenticated, adminOnly, async (req,
     const id = safeId(req.params.id);
     const points = Number(req.body?.points);
     const reason = String(req.body?.reason || "").trim();
-    const type = ["praise", "reminder", "criticism"].includes(String(req.body?.type))
-      ? String(req.body.type)
-      : points >= 0
-        ? "praise"
-        : "criticism";
+    const direction = points > 0 ? "add" : "subtract";
 
-    if (!id || !Number.isFinite(points) || points === 0 || Math.abs(points) > 100 || !reason) {
-      return res.status(400).json({ message: "Số điểm hoặc lý do không hợp lệ." });
+    if (!id || !Number.isInteger(points) || points === 0 || Math.abs(points) > 10 || !reason) {
+      return res.status(400).json({ message: "Điểm thay đổi phải là số nguyên từ -10 đến +10 và lý do là bắt buộc." });
     }
 
     const studentRef = db().collection("students").doc(id);
     const userRef = db().collection("users").doc(id);
     const notificationRef = db().collection("notifications").doc();
     const pointLogRef = db().collection("pointLogs").doc();
-
+    const auditRef = db().collection("auditLogs").doc();
     let result = null;
 
     await db().runTransaction(async (transaction) => {
       const snap = await transaction.get(studentRef);
       if (!snap.exists) throw new Error("Không tìm thấy học sinh.");
       const old = snap.data() || {};
-      const oldScore = Number(old.score ?? 10);
-      const newScore = oldScore + points;
+      const oldScore = Math.min(10, Math.max(0, Number(old.score ?? 10)));
+      const requestedNewScore = oldScore + points;
+      const newScore = Math.min(10, Math.max(0, requestedNewScore));
+      const effectivePoints = newScore - oldScore;
+      if (effectivePoints === 0) {
+        throw new Error(`Không thể ${direction === "add" ? "cộng" : "trừ"} điểm vì điểm hiện tại đã ở giới hạn ${direction === "add" ? "10" : "0"}.`);
+      }
+
       const entry = {
-        type,
-        points,
+        points: effectivePoints,
+        direction: effectivePoints > 0 ? "add" : "subtract",
         reason,
         byUid: req.user.uid,
         byEmail: cleanEmail(req.user.email),
         timestamp: new Date().toISOString(),
       };
-
       const history = Array.isArray(old.history) ? old.history : [];
+
       transaction.update(studentRef, {
         score: newScore,
         history: [...history, entry].slice(-100),
         updatedAt: SERVER_TIMESTAMP(),
       });
-
       transaction.set(pointLogRef, {
         studentUid: id,
-        points,
+        points: effectivePoints,
         previousScore: oldScore,
         newScore,
-        type,
+        direction: effectivePoints > 0 ? "add" : "subtract",
         reason,
         byUid: req.user.uid,
         byEmail: cleanEmail(req.user.email),
         createdAt: SERVER_TIMESTAMP(),
       });
-
       transaction.set(notificationRef, {
         recipientUid: id,
         category: "score",
-        type,
-        points,
-        title:
-          type === "praise"
-            ? "🎉 Khen thưởng"
-            : type === "reminder"
-              ? "⚠️ Nhắc nhở"
-              : "❌ Phê bình",
+        type: "score_addition",
+        direction: effectivePoints > 0 ? "add" : "subtract",
+        points: effectivePoints,
+        title: effectivePoints > 0 ? "🔺 Bạn vừa được cộng điểm" : "🔻 Bạn vừa bị trừ điểm",
         message: reason,
+        previousScore: oldScore,
+        newScore,
         read: false,
         createdAt: SERVER_TIMESTAMP(),
         createdBy: req.user.uid,
         pointLogId: pointLogRef.id,
       });
-
-      transaction.set(
-        userRef,
-        {
-          updatedAt: SERVER_TIMESTAMP(),
-          lastNotificationAt: SERVER_TIMESTAMP(),
-        },
-        { merge: true }
-      );
-
+      transaction.set(userRef, {
+        score: newScore,
+        updatedAt: SERVER_TIMESTAMP(),
+        lastNotificationAt: SERVER_TIMESTAMP(),
+      }, { merge: true });
+      transaction.set(auditRef, {
+        action: effectivePoints > 0 ? "score.add" : "score.subtract",
+        collection: "students",
+        targetId: id,
+        points: effectivePoints,
+        previousScore: oldScore,
+        newScore,
+        reason,
+        byUid: req.user.uid,
+        byEmail: cleanEmail(req.user.email),
+        createdAt: SERVER_TIMESTAMP(),
+      });
       result = {
         notificationId: notificationRef.id,
         pointLogId: pointLogRef.id,
+        auditLogId: auditRef.id,
         previousScore: oldScore,
         newScore,
+        effectivePoints,
       };
     });
 
     return res.json({ ok: true, ...result });
   } catch (error) {
-    return sendError(res, 500, "Không thể cập nhật điểm thi đua.", error);
+    return sendError(res, 400, "Không thể cập nhật điểm thi đua.", error);
   }
 });
 
-app.post("/api/admin/students/:id/reset-password", authenticated, adminOnly, async (req, res) => {
-  try {
-    const id = safeId(req.params.id);
-    const snap = await db().collection("students").doc(id).get();
-    if (!snap.exists) return res.status(404).json({ message: "Không tìm thấy học sinh." });
-
-    const student = snap.data() || {};
-    const uid = safeId(student.accountUid || student.studentUid || student.uid || id);
-    const target = await auth().getUser(uid);
-
-    if (cleanEmail(target.email) === SUPER_ADMIN_EMAIL) {
-      return res.status(403).json({ message: "Không được đổi mật khẩu Super Admin chính." });
-    }
-
-    const password = String(req.body?.password || "").trim() || randomPassword();
-    if (password.length < 6) return res.status(400).json({ message: "Mật khẩu tối thiểu 6 ký tự." });
-
-    await auth().updateUser(uid, { password });
-    await db().collection("users").doc(uid).set(
-      {
-        passwordResetAt: SERVER_TIMESTAMP(),
-        passwordResetBy: req.user.uid,
-        updatedAt: SERVER_TIMESTAMP(),
-      },
-      { merge: true }
-    );
-
-    return res.json({
-      ok: true,
-      uid,
-      email: target.email,
-      username: student.username || student.loginName || "",
-      temporaryPassword: password,
-    });
-  } catch (error) {
-    return sendError(res, 400, "Không thể cấp lại mật khẩu.", error);
-  }
-});
-
-app.delete("/api/admin/students/:id", authenticated, adminOnly, async (req, res) => {
-  try {
-    const id = safeId(req.params.id);
-    const studentRef = db().collection("students").doc(id);
-    const snap = await studentRef.get();
-    if (!snap.exists) return res.status(404).json({ message: "Không tìm thấy học sinh." });
-
-    const student = snap.data() || {};
-    const uid = safeId(student.accountUid || student.studentUid || student.uid || id);
-    if (uid) {
-      const target = await auth().getUser(uid);
-      if (cleanEmail(target.email) === SUPER_ADMIN_EMAIL) {
-        return res.status(403).json({ message: "Không được xóa Super Admin chính." });
-      }
-      await auth().deleteUser(uid).catch((error) => {
-        if (error?.code !== "auth/user-not-found") throw error;
-      });
-    }
-
-    const batch = db().batch();
-    batch.delete(studentRef);
-    if (uid) batch.delete(db().collection("users").doc(uid));
-    if (student.loginName || student.username) {
-      batch.delete(
-        db().collection("loginAliases").doc(
-          normalizeUsername(student.loginName || student.username)
-        )
-      );
-    }
-    await batch.commit();
-    return res.json({ ok: true });
-  } catch (error) {
-    return sendError(res, 500, "Không thể xóa học sinh và tài khoản liên kết.", error);
-  }
-});
-
-app.post("/api/admin/popup", authenticated, adminOnly, async (req, res) => {
-  try {
-    const title = String(req.body?.title || "").trim();
-    const content = String(req.body?.content || "").trim();
-    if (!title || !content) {
-      return res.status(400).json({ message: "Tiêu đề và nội dung Popup là bắt buộc." });
-    }
-
-    const style = sanitizePopupStyle(req.body);
-    const ref = await db().collection("popups").add({
-      title,
-      content,
-      active: req.body?.active !== false,
-      ...style,
-      createdBy: req.user.uid,
-      createdAt: SERVER_TIMESTAMP(),
-      updatedAt: SERVER_TIMESTAMP(),
-      dailyResetNonce: Date.now(),
-    });
-    return res.status(201).json({ ok: true, id: ref.id });
-  } catch (error) {
-    return sendError(res, 400, "Không thể tạo Popup.", error);
-  }
-});
-
-app.post("/api/admin/popup/reset", authenticated, adminOnly, async (req, res) => {
-  try {
-    const snap = await db().collection("popups").where("active", "==", true).get();
-    const batch = db().batch();
-    snap.docs.forEach((docSnap) =>
-      batch.update(docSnap.ref, {
-        dailyResetNonce: Date.now(),
-        dailyResetAt: SERVER_TIMESTAMP(),
-        updatedAt: SERVER_TIMESTAMP(),
-      })
-    );
-    if (snap.size) await batch.commit();
-    return res.json({ ok: true, count: snap.size });
-  } catch (error) {
-    return sendError(res, 500, "Không thể reset trạng thái Popup.", error);
-  }
-});
-
-app.post("/api/admin/notification", authenticated, adminOnly, async (req, res) => {
-  try {
-    const recipientUid = safeId(req.body?.recipientUid);
-    const type = ["praise", "reminder", "criticism"].includes(String(req.body?.type))
-      ? String(req.body.type)
-      : "reminder";
-    const title = String(req.body?.title || "").trim() ||
-      (type === "praise" ? "🎉 Khen thưởng" : type === "reminder" ? "⚠️ Nhắc nhở" : "❌ Phê bình");
-    const message = String(req.body?.message || "").trim();
-    if (!recipientUid || !message) return res.status(400).json({ message: "Thiếu học sinh hoặc lời nhắn." });
-
-    const ref = await db().collection("notifications").add({
-      recipientUid,
-      category: "private",
-      type,
-      title,
-      message,
-      read: false,
-      createdAt: SERVER_TIMESTAMP(),
-      createdBy: req.user.uid,
-      createdByEmail: cleanEmail(req.user.email),
-    });
-    return res.status(201).json({ ok: true, id: ref.id });
-  } catch (error) {
-    return sendError(res, 400, "Không thể gửi lời nhắn riêng.", error);
-  }
-});
-
-app.post("/api/admin/content/:collection", authenticated, adminOnly, async (req, res) => {
-  try {
-    const collectionName = safeId(req.params.collection);
-    if (!CONTENT_COLLECTIONS.has(collectionName)) {
-      return res.status(400).json({ message: `Collection ${collectionName} không được phép.` });
-    }
-
-    const payload = onlySafeContent(req.body || {});
-    payload.createdBy = req.user.uid;
-    payload.createdByEmail = cleanEmail(req.user.email);
-    payload.createdAt = SERVER_TIMESTAMP();
-    payload.updatedAt = SERVER_TIMESTAMP();
-
-    const ref = await db().collection(collectionName).add(payload);
-    return res.status(201).json({ ok: true, id: ref.id });
-  } catch (error) {
-    return sendError(res, 500, `Không thể tạo dữ liệu trong ${req.params.collection}.`, error);
-  }
-});
-
-app.patch("/api/admin/content/:collection/:id", authenticated, adminOnly, async (req, res) => {
-  try {
-    const collectionName = safeId(req.params.collection);
-    const id = safeId(req.params.id);
-    if (!CONTENT_COLLECTIONS.has(collectionName)) {
-      return res.status(400).json({ message: `Collection ${collectionName} không được phép.` });
-    }
-    if (!id) return res.status(400).json({ message: "Thiếu id." });
-
-    const patch = onlySafeContent(req.body || {});
-    patch.updatedAt = SERVER_TIMESTAMP();
-    await db().collection(collectionName).doc(id).update(patch);
-    return res.json({ ok: true });
-  } catch (error) {
-    return sendError(res, 500, "Không thể cập nhật dữ liệu.", error);
-  }
-});
-
-app.delete("/api/admin/content/:collection/:id", authenticated, adminOnly, async (req, res) => {
-  try {
-    const collectionName = safeId(req.params.collection);
-    const id = safeId(req.params.id);
-    if (!CONTENT_COLLECTIONS.has(collectionName)) {
-      return res.status(400).json({ message: `Collection ${collectionName} không được phép.` });
-    }
-    if (!id) return res.status(400).json({ message: "Thiếu id." });
-
-    await db().collection(collectionName).doc(id).delete();
-    return res.json({ ok: true });
-  } catch (error) {
-    return sendError(res, 500, "Không thể xóa dữ liệu.", error);
-  }
-});
-
-app.patch("/api/super-admin/users/:uid/role", authenticated, adminOnly, superOnly, async (req, res) => {
-  try {
-    const uid = safeId(req.params.uid);
-    const role = safeId(req.body?.role);
-    if (!uid || !["student", "admin"].includes(role)) {
-      return res.status(400).json({ message: "uid hoặc role không hợp lệ." });
-    }
-
-    const target = await auth().getUser(uid);
-    if (cleanEmail(target.email) === SUPER_ADMIN_EMAIL) {
-      return res.status(403).json({ message: "Không được hạ quyền Super Admin chính." });
-    }
-
-    await db().collection("users").doc(uid).set(
-      { role, updatedAt: SERVER_TIMESTAMP(), updatedBy: req.user.uid },
-      { merge: true }
-    );
-    await auth().setCustomUserClaims(uid, { role, admin: role === "admin" });
-
-    return res.json({ ok: true, uid, role });
-  } catch (error) {
-    return sendError(res, 400, "Không thể đổi role.", error);
-  }
-});
-
-app.delete("/api/admin/chat/rooms/:roomId", authenticated, adminOnly, async (req, res) => {
-  try {
-    const roomId = safeId(req.params.roomId);
-    if (!roomId) return res.status(400).json({ message: "Thiếu roomId." });
-    const roomRef = db().collection("chatRooms").doc(roomId);
-    if (typeof db().recursiveDelete === "function") {
-      await db().recursiveDelete(roomRef);
-    } else {
-      await roomRef.delete();
-    }
-    return res.json({ ok: true });
-  } catch (error) {
-    return sendError(res, 500, "Không thể xóa phòng chat.", error);
-  }
-});
-
-app.delete("/api/admin/chat/rooms/:roomId/messages/:messageId", authenticated, adminOnly, async (req, res) => {
-  try {
-    const roomId = safeId(req.params.roomId);
-    const messageId = safeId(req.params.messageId);
-    if (!roomId || !messageId) return res.status(400).json({ message: "Thiếu roomId hoặc messageId." });
-    await db().collection("chatRooms").doc(roomId).collection("messages").doc(messageId).delete();
-    return res.json({ ok: true });
-  } catch (error) {
-    return sendError(res, 500, "Không thể xóa tin nhắn.", error);
-  }
-});
-
-app.patch("/api/admin/chat/rooms/:roomId/lock", authenticated, adminOnly, async (req, res) => {
-  try {
-    const roomId = safeId(req.params.roomId);
-    const locked = Boolean(req.body?.locked);
-    await db().collection("chatRooms").doc(roomId).update({ locked, updatedAt: SERVER_TIMESTAMP() });
-    return res.json({ ok: true, locked });
-  } catch (error) {
-    return sendError(res, 500, "Không thể khóa/mở phòng chat.", error);
-  }
-});
 
 app.get("/manifest.webmanifest", (req, res) => {
   res
